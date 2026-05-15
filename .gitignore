@@ -1,0 +1,56 @@
+# secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.eggs/
+*.egg-info/
+*.egg
+dist/
+build/
+
+# data + db
+*.sqlite
+*.sqlite3
+*.db
+data/raw/
+data/processed/
+data/cache/
+*.csv.bak
+
+# models
+models/checkpoints/
+models/*.pkl
+models/*.joblib
+
+# notebooks
+.ipynb_checkpoints/
+
+# ide / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# logs
+*.log
+logs/
+
+# scratch (any underscore-prefixed temp scripts/output)
+_*.bat
+_*.txt
+_*_output.*

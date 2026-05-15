@@ -1,0 +1,30 @@
+# core
+httpx>=0.27.0
+python-dotenv>=1.0.1
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+
+# kalshi sdk (uses RSA signing under the hood)
+kalshi-python>=2.0.0
+cryptography>=42.0.0
+
+# data + db
+pandas>=2.2.0
+numpy>=1.26.0
+sqlalchemy>=2.0.30
+alembic>=1.13.0
+
+# ml
+scikit-learn>=1.5.0
+xgboost>=2.0.0
+
+# viz + dashboard
+matplotlib>=3.9.0
+streamlit>=1.35.0
+
+# dev / testing
+pytest>=8.2.0
+pytest-asyncio>=0.23.0
+ruff>=0.4.0
+black>=24.4.0
+ipykernel>=6.29.0
