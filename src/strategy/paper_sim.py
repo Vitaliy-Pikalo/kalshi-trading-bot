@@ -15,7 +15,7 @@ import argparse
 import math
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src.utils import setup_utf8_stdout
 
@@ -27,10 +27,12 @@ from src.config import settings  # noqa: E402
 from src.db import Fill, Market, Prediction as PredRow, Snapshot, session_scope  # noqa: E402
 from src.strategy.base import Baseline  # noqa: E402
 from src.strategy.crypto_vol import CryptoVolBaseline  # noqa: E402
+from src.strategy.tennis_elo import TennisEloBaseline  # noqa: E402
 
 # baselines registered: paper sim runs each market through each baseline
-# that returns a non-None prediction.
-BASELINES: list[Baseline] = [CryptoVolBaseline()]
+# that returns a non-None prediction. each baseline returns None for markets
+# it doesn't handle, so registering all is safe.
+BASELINES: list[Baseline] = [CryptoVolBaseline(), TennisEloBaseline()]
 
 
 def kelly_size(
@@ -62,20 +64,36 @@ def paper_trade_once(
     min_edge: float | None = None,
     max_markets: int = 500,
     require_liquidity: bool = True,
+    dedup_window_minutes: int = 30,
 ) -> dict:
-    """One pass over recent (market, latest_snapshot) pairs. Returns stats."""
+    """One pass over recent (market, latest_snapshot) pairs. Returns stats.
+
+    dedup_window_minutes: skip ticker if we've placed a paper fill within this window
+    """
     if min_edge is None:
         min_edge = settings.min_edge_pct / 100.0
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
+    dedup_cutoff = now - timedelta(minutes=dedup_window_minutes)
     stats = {
         "markets_seen": 0,
         "predictions_written": 0,
         "trades_paper": 0,
+        "trades_skipped_dedup": 0,
         "edge_distribution": [],
     }
 
     with session_scope() as s:
+        # tickers we've already paper-traded recently
+        recent_fill_tickers = set(
+            r[0] for r in s.execute(
+                select(Fill.ticker)
+                .where(Fill.is_paper == 1)
+                .where(Fill.ts > dedup_cutoff)
+                .distinct()
+            ).all()
+        )
+
         # markets closing in next 48h with at least one snapshot
         market_rows = s.execute(
             select(Market)
@@ -132,6 +150,11 @@ def paper_trade_once(
                 if require_liquidity and (snap.yes_ask is None or snap.yes_ask <= 0):
                     continue
                 if abs(pred.edge) < min_edge:
+                    continue
+
+                # dedup check
+                if m.ticker in recent_fill_tickers:
+                    stats["trades_skipped_dedup"] += 1
                     continue
 
                 stats["edge_distribution"].append(pred.edge)
@@ -207,7 +230,8 @@ def main() -> int:
         print(
             f"[{ts}] cycle #{cycle}: seen={stats['markets_seen']:4d} "
             f"preds={stats['predictions_written']:4d} "
-            f"paper_trades={stats['trades_paper']:3d}  {edge_summary}  "
+            f"paper_trades={stats['trades_paper']:3d} "
+            f"dedup_skip={stats['trades_skipped_dedup']:3d}  {edge_summary}  "
             f"({elapsed:.1f}s)"
         )
 
