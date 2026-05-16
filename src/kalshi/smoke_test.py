@@ -11,13 +11,11 @@ run:
 """
 from __future__ import annotations
 
-import io
 import sys
 
-# force utf-8 stdout on windows so cmd doesn't choke on non-ascii
-if sys.platform == "win32":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+from src.utils import setup_utf8_stdout
+
+setup_utf8_stdout()
 
 from src.config import settings  # noqa: E402
 from src.kalshi.client import KalshiClient, _load_private_key  # noqa: E402

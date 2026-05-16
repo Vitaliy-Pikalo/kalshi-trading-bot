@@ -5,9 +5,14 @@ uses RSA signing per kalshi docs: https://trading-api.readme.io/reference/api-ke
 every request signs `timestamp + method + path` with the private key.
 the kalshi-python SDK handles this for us — this module wraps it with
 our settings + sane defaults.
+
+rate limiting:
+    kalshi caps at ~10 req/sec for the read endpoints. we self-throttle
+    to ~8 req/sec and retry once on 429 with exponential backoff.
 """
 from __future__ import annotations
 
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -16,6 +21,20 @@ import httpx
 from cryptography.hazmat.primitives import serialization
 
 from src.config import settings
+
+# self-throttle: minimum seconds between requests
+_MIN_REQUEST_INTERVAL_S = 0.12  # ~8 req/sec
+_last_request_ts = 0.0
+
+
+def _throttle() -> None:
+    """Sleep if needed to keep us under the rate limit."""
+    global _last_request_ts
+    now = time.monotonic()
+    delta = now - _last_request_ts
+    if delta < _MIN_REQUEST_INTERVAL_S:
+        time.sleep(_MIN_REQUEST_INTERVAL_S - delta)
+    _last_request_ts = time.monotonic()
 
 
 @lru_cache(maxsize=1)
@@ -93,27 +112,144 @@ class KalshiClient:
         base_path = urlparse(self.base_url).path  # /trade-api/v2
         return base_path + endpoint
 
-    def get(self, endpoint: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Authenticated GET. `endpoint` is relative, e.g. '/markets'."""
+    def get(
+        self,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        max_retries: int = 3,
+    ) -> dict[str, Any]:
+        """Authenticated GET. `endpoint` is relative, e.g. '/markets'.
+
+        Self-throttles + retries on 429 with exponential backoff.
+        """
         if self._client is None:
             raise RuntimeError("use as context manager: `with KalshiClient() as k:`")
         if not endpoint.startswith("/"):
             endpoint = "/" + endpoint
-        path_to_sign = self._path_for_signing(endpoint)
-        headers = self._signed_headers("GET", path_to_sign)
         url = self.base_url + endpoint
-        r = self._client.get(url, headers=headers, params=params)
+        path_to_sign = self._path_for_signing(endpoint)
+
+        backoff = 1.0
+        for attempt in range(max_retries):
+            _throttle()
+            # signature is per-request (includes timestamp), so re-sign each retry
+            headers = self._signed_headers("GET", path_to_sign)
+            r = self._client.get(url, headers=headers, params=params)
+            if r.status_code == 429 and attempt < max_retries - 1:
+                # respect Retry-After if present, else exponential backoff
+                wait = float(r.headers.get("Retry-After", backoff))
+                time.sleep(wait)
+                backoff *= 2
+                continue
+            r.raise_for_status()
+            return r.json()
+        # shouldn't reach here, but for type safety
         r.raise_for_status()
         return r.json()
 
     def list_markets(
         self,
-        status: str = "open",
-        limit: int = 20,
+        status: str | None = "open",
+        limit: int = 100,
         cursor: str | None = None,
+        event_ticker: str | None = None,
+        series_ticker: str | None = None,
+        tickers: str | None = None,
     ) -> dict[str, Any]:
-        """List markets. status one of: open, closed, settled."""
-        params = {"status": status, "limit": limit}
+        """List markets.
+
+        status: open | closed | settled | None (all)
+        limit: 1-1000 (kalshi caps at 1000)
+        cursor: pagination token from previous response
+        event_ticker / series_ticker: scope to a parent
+        tickers: comma-separated ticker list to fetch specific markets
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if status:
+            params["status"] = status
         if cursor:
             params["cursor"] = cursor
+        if event_ticker:
+            params["event_ticker"] = event_ticker
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        if tickers:
+            params["tickers"] = tickers
         return self.get("/markets", params=params)
+
+    def iter_markets(
+        self,
+        status: str | None = "open",
+        page_size: int = 1000,
+        max_pages: int = 50,
+        **filters: Any,
+    ):
+        """Generator that auto-paginates through all matching markets.
+
+        Yields one market dict at a time. Stops at max_pages safety cap.
+        """
+        cursor = None
+        for _ in range(max_pages):
+            resp = self.list_markets(
+                status=status, limit=page_size, cursor=cursor, **filters
+            )
+            for m in resp.get("markets", []):
+                yield m
+            cursor = resp.get("cursor")
+            if not cursor:
+                return
+
+    def get_market(self, ticker: str) -> dict[str, Any]:
+        """Full detail of a single market."""
+        return self.get(f"/markets/{ticker}")
+
+    def list_events(
+        self,
+        status: str | None = "open",
+        limit: int = 100,
+        cursor: str | None = None,
+        series_ticker: str | None = None,
+        with_nested_markets: bool = False,
+    ) -> dict[str, Any]:
+        """List events. Events group related markets (e.g. one french open
+        match has yes/no for each player as separate markets but same event).
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if status:
+            params["status"] = status
+        if cursor:
+            params["cursor"] = cursor
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        if with_nested_markets:
+            params["with_nested_markets"] = "true"
+        return self.get("/events", params=params)
+
+    def get_event(
+        self, event_ticker: str, with_nested_markets: bool = True
+    ) -> dict[str, Any]:
+        """Full event detail; includes child markets if with_nested_markets."""
+        params: dict[str, Any] = {}
+        if with_nested_markets:
+            params["with_nested_markets"] = "true"
+        return self.get(f"/events/{event_ticker}", params=params)
+
+    def list_series(
+        self,
+        category: str | None = None,
+        include_product_metadata: bool = False,
+    ) -> dict[str, Any]:
+        """List series (top-level market groupings).
+
+        category: e.g. 'Sports', 'Crypto', 'Climate', 'Politics'.
+        """
+        params: dict[str, Any] = {}
+        if category:
+            params["category"] = category
+        if include_product_metadata:
+            params["include_product_metadata"] = "true"
+        return self.get("/series", params=params)
+
+    def get_orderbook(self, ticker: str, depth: int = 10) -> dict[str, Any]:
+        """Top-of-book + depth for a market."""
+        return self.get(f"/markets/{ticker}/orderbook", params={"depth": depth})
