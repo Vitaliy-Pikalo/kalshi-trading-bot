@@ -79,6 +79,46 @@ def get_active_tickers(
     return [r[0] for r in rows]
 
 
+def _dollars_to_cents(v) -> int | None:
+    """Kalshi returns prices as dollar-strings like '0.0100'. Convert to int cents."""
+    if v is None or v == "":
+        return None
+    try:
+        return int(round(float(v) * 100))
+    except (ValueError, TypeError):
+        return None
+
+
+def _to_int(v) -> int | None:
+    """Kalshi returns volume/oi as string floats like '19556.00'."""
+    if v is None or v == "":
+        return None
+    try:
+        return int(float(v))
+    except (ValueError, TypeError):
+        return None
+
+
+def _extract_market_fields(m: dict) -> dict:
+    """Extract bid/ask/volume from a kalshi market dict, handling both legacy
+    (int cents) and current (string dollars) field naming."""
+    return {
+        "yes_bid": _dollars_to_cents(m.get("yes_bid_dollars"))
+        if "yes_bid_dollars" in m else m.get("yes_bid"),
+        "yes_ask": _dollars_to_cents(m.get("yes_ask_dollars"))
+        if "yes_ask_dollars" in m else m.get("yes_ask"),
+        "no_bid": _dollars_to_cents(m.get("no_bid_dollars"))
+        if "no_bid_dollars" in m else m.get("no_bid"),
+        "no_ask": _dollars_to_cents(m.get("no_ask_dollars"))
+        if "no_ask_dollars" in m else m.get("no_ask"),
+        "last_price": _dollars_to_cents(m.get("last_price_dollars"))
+        if "last_price_dollars" in m else m.get("last_price"),
+        "volume": _to_int(m.get("volume_fp")) if "volume_fp" in m else m.get("volume"),
+        "open_interest": _to_int(m.get("open_interest_fp"))
+        if "open_interest_fp" in m else m.get("open_interest"),
+    }
+
+
 def poll_once(
     client: KalshiClient,
     tickers: list[str],
@@ -101,16 +141,11 @@ def poll_once(
         markets = resp.get("markets", [])
         with session_scope() as s:
             for m in markets:
+                fields = _extract_market_fields(m)
                 snap = Snapshot(
                     ticker=m.get("ticker"),
                     ts=now,
-                    yes_bid=m.get("yes_bid"),
-                    yes_ask=m.get("yes_ask"),
-                    no_bid=m.get("no_bid"),
-                    no_ask=m.get("no_ask"),
-                    last_price=m.get("last_price"),
-                    volume=m.get("volume"),
-                    open_interest=m.get("open_interest"),
+                    **fields,
                 )
                 s.add(snap)
                 rows_written += 1
