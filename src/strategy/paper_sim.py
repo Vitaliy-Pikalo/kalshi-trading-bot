@@ -65,10 +65,16 @@ def paper_trade_once(
     max_markets: int = 500,
     require_liquidity: bool = True,
     dedup_window_minutes: int = 30,
+    max_credible_edge: float = 0.50,
+    min_price_cents: int = 2,
+    max_price_cents: int = 98,
+    min_volume: int = 0,
 ) -> dict:
     """One pass over recent (market, latest_snapshot) pairs. Returns stats.
 
     dedup_window_minutes: skip ticker if we've placed a paper fill within this window
+    max_credible_edge: skip if |edge| > this (almost always model bug, not real edge)
+    min_price_cents / max_price_cents: avoid 1¢ and 99¢ markets (huge round-trip cost)
     """
     if min_edge is None:
         min_edge = settings.min_edge_pct / 100.0
@@ -80,6 +86,8 @@ def paper_trade_once(
         "predictions_written": 0,
         "trades_paper": 0,
         "trades_skipped_dedup": 0,
+        "trades_skipped_edge_too_big": 0,
+        "trades_skipped_price_range": 0,
         "edge_distribution": [],
     }
 
@@ -112,6 +120,9 @@ def paper_trade_once(
             ).scalar_one_or_none()
 
             if snap is None:
+                continue
+            # volume filter — dead markets are mostly market-maker phantom orders
+            if min_volume > 0 and (snap.volume or 0) < min_volume:
                 continue
             stats["markets_seen"] += 1
 
@@ -157,6 +168,11 @@ def paper_trade_once(
                     stats["trades_skipped_dedup"] += 1
                     continue
 
+                # max-credible-edge gate: massive edges are usually model bugs
+                if abs(pred.edge) > max_credible_edge:
+                    stats["trades_skipped_edge_too_big"] += 1
+                    continue
+
                 stats["edge_distribution"].append(pred.edge)
 
                 # which side? if predicted > implied, buy YES at yes_ask
@@ -168,6 +184,10 @@ def paper_trade_once(
                     side = "no"
                     price_cents = snap.no_ask or 0
                 if price_cents <= 0 or price_cents >= 100:
+                    continue
+                # min/max price gate: avoid 1¢ and 99¢ markets (huge spread cost)
+                if price_cents < min_price_cents or price_cents > max_price_cents:
+                    stats["trades_skipped_price_range"] += 1
                     continue
 
                 # size with fractional kelly
@@ -231,8 +251,10 @@ def main() -> int:
             f"[{ts}] cycle #{cycle}: seen={stats['markets_seen']:4d} "
             f"preds={stats['predictions_written']:4d} "
             f"paper_trades={stats['trades_paper']:3d} "
-            f"dedup_skip={stats['trades_skipped_dedup']:3d}  {edge_summary}  "
-            f"({elapsed:.1f}s)"
+            f"skipped(dedup={stats['trades_skipped_dedup']}, "
+            f"edge_too_big={stats['trades_skipped_edge_too_big']}, "
+            f"price={stats['trades_skipped_price_range']})  "
+            f"{edge_summary}  ({elapsed:.1f}s)"
         )
 
         if args.once:

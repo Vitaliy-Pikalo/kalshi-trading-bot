@@ -1,7 +1,7 @@
 # handoff doc — kalshi trading bot
 
-**last updated:** 2026-05-16 (session 2 wrap)
-**phase:** 1 partially complete (pipeline working end-to-end on prod)
+**last updated:** 2026-05-16 (session 2 wrap, daemon running)
+**phase:** 1 complete-ish (pipeline working end-to-end, daemon running overnight to accumulate data)
 **repo:** https://github.com/Vitaliy-Pikalo/kalshi-trading-bot (public)
 **local:** `C:\Users\pikal\Downloads\claude project`
 
@@ -9,148 +9,202 @@
 
 ## project context
 
-kalshi prediction market trading bot. prices binary event markets using ML + sizes positions with poker bankroll math (fractional kelly, EV thresholds). passion project + quant internship signal + small real $ side bet.
+kalshi prediction market trading bot. prices binary event markets using ML + sizes positions with poker bankroll math (fractional kelly, EV thresholds). passion project + quant internship signal + small real $ side project.
 
-three-way thesis:
-1. **passion** — poker math (EV, kelly, variance) applied to a live game
-2. **quant signal** — same work SIG / Susquehanna / Jane Street do in event markets
-3. **real $** — kalshi is CFTC-regulated US legal. $100 paper through phase 3, $100 live in phase 4
+categories chosen: **crypto** (BTC/ETH daily) primary, **tennis** (ATP/WTA) secondary. running both in parallel.
 
-categories chosen: **crypto** (BTC/ETH daily + 15m) + **tennis** (ATP/WTA matches). running both in parallel.
+**user goal:** narrow + nail one market type for predictable consistent returns. focus on ATM BTC dailies during Tokyo hours (0-8 UTC). low risk, not high frequency. paper now, real $ in phase 4.
 
 ---
 
 ## status map
 
-| phase | name | weeks | status |
-|---|---|---|---|
-| 0 | setup + skeleton | 0-1 | ✅ done |
-| 1 | data ingestion + paper trade | 1-2 | 🚧 ~80% done |
-| 2 | ml edge model + backtest | 3-6 | pending |
-| 3 | poker-math layer (kelly + risk) | 7-9 | pending |
-| 4 | go live + writeup | 10-12 | pending |
+| phase | name | status |
+|---|---|---|
+| 0 | setup + skeleton | ✅ |
+| 1 | data ingestion + paper trade | ✅ pipeline done, daemon running for data |
+| 2 | ml edge model + backtest | next — start by reviewing daemon results |
+| 3 | poker-math layer (kelly + risk) | pending |
+| 4 | go live + writeup | pending |
+
+---
+
+## what's running RIGHT NOW
+
+a **daemon** at `src/run/daemon.py` is (or should be) running in the background. it:
+
+- polls 768+ active markets every **60 sec** → snapshots table
+- runs paper sim every **5 min** with conservative gates → predictions + fills
+- settles closed fills every **30 min** → realized P&L
+- refreshes market catalog every **6 hours**
+- logs every action to `_daemon.log`
+
+**conservative gates** (the active preset):
+| gate | value | purpose |
+|---|---|---|
+| min_edge | 3% | don't trade noise |
+| max_credible_edge | 30% | skip "too good to be true" (model bug) |
+| min_price_cents | 5 | avoid 1¢-4¢ tail markets (huge round-trip) |
+| max_price_cents | 95 | same on the other side |
+| dedup_window | 4 hours | don't re-trade same market |
+| min_volume | 1000 | market must have real activity |
+| kelly_fraction | 0.25 | quarter-kelly (poker standard) |
+| max_risk_per_trade | 1% of bankroll | hard cap |
+
+---
+
+## first 5 things to do in next session
+
+1. **check the daemon is still alive + healthy**
+   ```
+   double-click _daemon_status.bat
+   ```
+   - look at _daemon.log tail: should see POLL/TRADE/SETTLE entries
+   - look at db state: snapshots should be 10k+, predictions 2k+, fills 200+
+   - look at realized_pnl: this is the headline number
+2. **run analysis**
+   ```
+   .venv\Scripts\python.exe -m src.analyze
+   ```
+   - win rate, total P&L, calibration plot
+3. **identify what worked**
+   - which series_ticker had best return? (KXBTCD likely)
+   - which strike-distance-from-spot bucket worked best?
+   - what time of day did best (Tokyo 0-8 vs NY 13-21 UTC)?
+4. **tune gates based on data** — narrow further to what worked
+5. **decide phase 2 model** — xgboost on the features we now have, or stay with vol baseline + better tuning
 
 ---
 
 ## what's been done
 
-### phase 0 (shipped to github)
-- kalshi RSA-signed REST client, sqlite schema (5 tables), pydantic config, smoke test
-- git repo, github public repo, first commit pushed
+### phase 0 (committed)
+RSA-signed kalshi client, sqlite schema, pydantic config, smoke test, public github repo
 
-### phase 1 (huge progress this session)
-- **expanded kalshi client** — added list_events, get_market, get_event, list_series, get_orderbook, iter_markets (pagination), self-throttling + 429 retry
-- **probe scripts** — `src/kalshi/probe_categories.py` (lists all 10,361 series by category), `src/kalshi/probe_market.py` (deep-dives a single market)
-- **market discovery + classifier** — `src/ingest/discover.py` walks series, classifies crypto/tennis/other, upserts to db
-- **coinbase spot client** — `src/spot/coinbase.py` pulls live BTC/ETH prices + historical candles + 30d realized vol (no auth)
-- **snapshot poller** — `src/ingest/poller.py` polls bid/ask/volume every 60s for active markets (closing in 48h), bulk fetch via `tickers=` param
-- **crypto vol baseline** — `src/strategy/crypto_vol.py` log-normal pricing model, parses ticker for strike+direction, computes P(yes) for any BTC/ETH binary
-- **paper trade simulator** — `src/strategy/paper_sim.py` runs baseline → writes prediction + paper fill if |edge| > threshold + has liquidity, uses fractional Kelly sizing
-- **db wipe + inspect** — `src/db_wipe.py`, `src/db_inspect.py`, `src/diagnose.py` for ops
-- **utils** — `src/utils.py` idempotent utf-8 stdout setup
-- **migrated to PROD env** — kalshi auth works on prod, real liquidity confirmed
+### phase 1 (committed across 5 commits)
+- expanded kalshi client (events, market detail, orderbook, bulk fetch, rate limit + retry)
+- market discovery + classifier (crypto + tennis, scoped to BTC/ETH + ATP/WTA)
+- coinbase spot/vol client
+- snapshot poller (bulk fetch, handles `*_dollars` field names)
+- crypto vol baseline (log-normal, clipped to [0.5%, 99.5%])
+- tennis Elo baseline (Sackmann data, surface-adjusted, predicts P(player A wins))
+- paper trade simulator with dedup + max-edge gate + price gate + volume floor
+- settlement worker (turns paper fills into realized P&L)
+- analyzer (win rate, sharpe, calibration)
+- diagnose script (edge histogram, liquid markets sample)
+- production daemon (set-and-forget, multi-stage scheduler)
 
 ### key wins
-- **end-to-end pipeline functional on prod:** 1547 markets discovered, 768 actively snapshotted, 498 predictions, 157 paper trades fired in single cycle
-- **real liquidity confirmed:** BTC15M markets have volumes >300k contracts, BTCD strikes near spot trade actively
-- **kalshi field name fix** — discovered kalshi returns `yes_bid_dollars` (string) not `yes_bid` (int cents). poller now handles both formats
-
-### code stats
-- ~1,425 lines added this session
-- 13 new files
-- 3 commits pushed: `bb65ed6`, `4ad4766`, `732a280`
+- **end-to-end pipeline functional on PROD** with real kalshi auth + real liquidity
+- **field-name bug fixed** (kalshi returns `yes_bid_dollars` string not `yes_bid` int)
+- **prob clipping** removes phantom +99% edges (log-normal underestimates tails)
+- **dedup window** prevents duplicate fills on same market
+- **5 commits pushed to github**
 
 ---
 
 ## current task / step / phase
 
-**phase 1 ~80% complete.** all infrastructure built and verified against live prod data. remaining:
-
-1. **settlement tracking** — when market settles, fetch outcome from kalshi + compute realized P&L on paper fills. without this, paper trades are meaningless
-2. **tennis Elo baseline** (tasks 17 + 18) — fetch JeffSackmann ATP/WTA data, compute surface-adjusted Elo ratings, implement Baseline interface for tennis matches
-3. **phase 1 checkpoint** (task 16) — run poller + paper sim continuously for 24-48h, accumulate 100+ paper trades with settled outcomes, compute realized edge vs predicted edge
+**daemon is running overnight**. next session:
+1. check what it accumulated (snapshots, fills, settled, realized P&L)
+2. analyze: did the bot make or lose money? on which markets?
+3. tune the strategy or pivot to ML based on findings
 
 ---
 
 ## what still needs to be done
 
-### phase 1 remaining
-- [ ] settlement worker — runs hourly, finds fills where market closed, fetches result, updates Fill.realized_pnl
-- [ ] tennis data client — pull JeffSackmann/tennis_atp historical match data
-- [ ] tennis Elo baseline — surface-adjusted, accounts for elo decay
-- [ ] phase 1 checkpoint — run 24h+, verify >100 settled paper trades, edge analysis
-- [ ] honest model critique — current model has 0/1 saturation issue (log-normal assumes 0% tail prob). real BTC has fat tails. edge=0.99 readings are illusory
-- [ ] fix deprecation warnings — `datetime.utcnow()` is deprecated in Python 3.14, switch to `datetime.now(timezone.utc)`
+### immediate (next session)
+- [ ] verify daemon was healthy overnight (no crashes)
+- [ ] settle remaining fills, get realized P&L
+- [ ] analyze by market type, by time-of-day, by strike-distance
+- [ ] decide: continue tuning vol baseline OR move to xgboost ML
 
-### phase 2 (when phase 1 verified)
-- xgboost edge model with proper time-series CV
-- features: lagged spot, vol regime, time-to-expiry, market microstructure (spread, depth)
-- calibration: isotonic regression to map raw model output to actual probability
-- backtest harness with realistic slippage + fees
+### phase 1 polish
+- [ ] datetime.utcnow() deprecation fix (replace with `datetime.now(timezone.utc)`)
+- [ ] tennis surface lookup expansion (french open = clay, may 24+)
+- [ ] add coinbase spot to snapshot table (or separate spot_history table) for ML features
+
+### phase 2 (when data validates)
+- [ ] feature engineering (see `src/features/crypto.py` — already scaffolded)
+- [ ] xgboost training (`src/models/train.py` — needs creating)
+- [ ] isotonic calibration of raw model output → real probability
+- [ ] backtest harness with time-series CV (no future leakage)
+- [ ] ML baseline implementing Baseline interface (loads trained model + predicts)
+
+### phase 3 (when ML beats baseline)
+- [ ] portfolio-level kelly (correlated positions)
+- [ ] dynamic position sizing based on edge confidence
+- [ ] drawdown circuit breaker
+- [ ] streamlit dashboard
+
+### phase 4 (when backtest sharpe > 1)
+- [ ] switch is_paper=0 (real $ trading)
+- [ ] start with $100 bankroll
+- [ ] write public blog post
+- [ ] github README polish + open-source
 
 ---
 
 ## next step (for fresh chat)
 
-1. read this HANDOFF.md + the project brief
-2. **first task**: implement settlement tracking
-   - new module `src/ingest/settler.py`
-   - finds fills with NULL realized_pnl whose market.close_ts < now
-   - fetches `get_market(ticker)` to read `result` field
-   - computes P&L: if won → contracts * (100 - price_cents) cents, if lost → -contracts * price_cents
-   - updates Fill.realized_pnl in cents
-3. then start tennis baseline (task 17 → 18)
-4. then run 24h soak test for phase 1 checkpoint
+paste this into the new chat to resume context:
+
+> i'm continuing my kalshi trading bot project. repo: https://github.com/Vitaliy-Pikalo/kalshi-trading-bot. read HANDOFF.md in the project folder. a daemon has been running overnight at `_daemon.log` — start by running `_daemon_status.bat` to see what we have, then `python -m src.analyze` for P&L. then help me decide next steps based on results.
 
 ---
 
 ## workflow rules
 
-- one phase at a time. don't skip ahead to phase 2 until phase 1 settlement + realized P&L is working
+- one phase at a time
 - one task at a time with explicit verification
 - backtest before paper trade, paper trade before real $
 - log everything to sqlite (markets, snapshots, predictions, fills, bankroll)
-- git commit after every working feature, push to github
+- git commit after every working feature
 - max risk: 1% bankroll per position (fractional kelly k=0.25)
 - never paste private keys, passwords, or KYC info into chat
-- use `_*.bat` scripts for command execution (gitignored). real code goes in `src/`
-- prod env is OK for read-only operations. orders require explicit user approval
+- use `_*.bat` scripts for command execution (gitignored). real code in `src/`
+- PROD env OK for read-only. orders require explicit user approval (phase 4)
 
 ---
 
-## quickstart for next session
+## key files for next session
+
+read in this order:
+1. **HANDOFF.md** (this file)
+2. **_daemon.log** (or `_daemon_cons.log`, `_daemon_bal.log` if dual run)
+3. `src/run/daemon.py` (current scheduler)
+4. `src/strategy/paper_sim.py` (gates + dedup logic)
+5. `src/strategy/crypto_vol.py` (prediction model)
+6. `src/db.py` (data model)
+
+---
+
+## quickstart commands
 
 ```powershell
-# verify env works (from project root)
 cd C:\Users\pikal\Downloads\claude project
 
-# verify pipeline still runs
+# verify all still works
 .venv\Scripts\python.exe -m src.kalshi.smoke_test
-.venv\Scripts\python.exe -m src.ingest.poller --once
-.venv\Scripts\python.exe -m src.strategy.paper_sim --once
 .venv\Scripts\python.exe -m src.diagnose
+
+# check daemon status
+double-click _daemon_status.bat
+
+# stop daemon if needed
+double-click _daemon_stop.bat
+
+# settle + analyze on demand
+.venv\Scripts\python.exe -m src.ingest.settler
+.venv\Scripts\python.exe -m src.analyze
+
+# restart daemon
+double-click _start_daemon.bat
 ```
 
-if `.env` got reset: KALSHI_ENV=prod, KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_PATH=`C:\Users\pikal\Downloads\bot.txt` (or wherever you moved it)
-
 ---
 
-## key files for next session to read
+## one-line elevator pitch
 
-1. `HANDOFF.md` (this file)
-2. `README.md`
-3. `src/config.py` — pydantic settings + risk defaults
-4. `src/db.py` — sqlite schema
-5. `src/kalshi/client.py` — RSA-signed API, rate limiting, all endpoint wrappers
-6. `src/ingest/discover.py` — series-scoped market discovery + classifier
-7. `src/ingest/poller.py` — bulk snapshot polling with field-name handling
-8. `src/strategy/base.py` — Baseline ABC + Prediction dataclass
-9. `src/strategy/crypto_vol.py` — log-normal vol baseline (parses ticker for strike)
-10. `src/strategy/paper_sim.py` — fractional Kelly paper trader
-11. `src/diagnose.py` — edge distribution + sample liquid markets
-
----
-
-## one-line elevator pitch (current)
-
-"i built a kalshi prediction market bot that pulls real-time crypto + tennis market data, prices each binary using log-normal vol models, sizes positions with fractional kelly criterion from poker bankroll theory, and runs a paper trader against live prod data. currently logging 157 paper trades per polling cycle with proper edge filtering, working toward settlement tracking + realized P&L for phase 1 checkpoint."
+"i built a kalshi prediction market trading bot from scratch in python — RSA-authenticated API client, sqlite event store, log-normal volatility pricing on BTC/ETH dailies, surface-adjusted Elo for ATP/WTA matches, fractional kelly position sizing from poker bankroll theory, running 24/7 as a daemon against live kalshi prod data. paper trading currently; switching to real $ after backtest validation."

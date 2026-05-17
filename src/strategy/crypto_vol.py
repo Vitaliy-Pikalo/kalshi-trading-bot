@@ -59,7 +59,12 @@ def parse_ticker(ticker: str) -> tuple[str, str, float] | None:
 
 
 def log_normal_prob_above(spot: float, strike: float, sigma: float, T_years: float) -> float:
-    """P(S_T >= K) under log-normal with σ vol, T years, drift = 0."""
+    """P(S_T >= K) under log-normal with σ vol, T years, drift = 0.
+
+    Clipped to [0.005, 0.995] because real-world tail probabilities are never
+    exactly zero — log-normal underestimates tails (BTC has fat tails). Clipping
+    prevents the model from generating phantom 99% edges on far-OTM strikes.
+    """
     if T_years <= 0:
         return 1.0 if spot >= strike else 0.0
     if sigma <= 0:
@@ -68,7 +73,9 @@ def log_normal_prob_above(spot: float, strike: float, sigma: float, T_years: flo
     d2 = (math.log(spot / strike) - 0.5 * sigma * sigma * T_years) / (
         sigma * math.sqrt(T_years)
     )
-    return _normal_cdf(d2)
+    raw = _normal_cdf(d2)
+    # clip to acknowledge fat tails — pure log-normal way underestimates them
+    return max(0.005, min(0.995, raw))
 
 
 def _normal_cdf(x: float) -> float:
