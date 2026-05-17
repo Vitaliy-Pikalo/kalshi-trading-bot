@@ -97,16 +97,27 @@ def _vol_cached(pair: str, bucket: int) -> float:
 
 
 class CryptoVolBaseline(Baseline):
-    name = "crypto_vol_v0"
+    name = "crypto_vol_v1"  # v1: uses kalshi strike_type (was v0: ticker parsing — BUGGY)
 
     def predict(self, market: dict, snapshot: dict | None = None) -> Prediction | None:
         import time as _time
 
         ticker = market.get("ticker", "")
-        parsed = parse_ticker(ticker)
-        if not parsed:
+        # determine underlying pair from ticker prefix
+        pair = None
+        for prefix, p in _TICKER_TO_PAIR.items():
+            if ticker.startswith(prefix + "-"):
+                pair = p
+                break
+        if pair is None:
             return None
-        pair, direction, strike = parsed
+
+        # use kalshi's strike fields (source of truth, not ticker regex)
+        strike_type = market.get("strike_type")
+        floor_strike = market.get("floor_strike")
+        cap_strike = market.get("cap_strike")
+        if strike_type is None or (floor_strike is None and cap_strike is None):
+            return None
 
         # time to expiry
         close_ts = market.get("close_ts")
@@ -126,8 +137,30 @@ class CryptoVolBaseline(Baseline):
         spot = _spot_cached(pair, int(_time.time() / 30))
         sigma = _vol_cached(pair, int(_time.time() / 3600))
 
-        p_above = log_normal_prob_above(spot, strike, sigma, T_years)
-        predicted = p_above if direction == "above" else (1.0 - p_above)
+        # compute predicted prob based on strike_type
+        if strike_type == "greater":
+            # yes if S_T >= floor_strike
+            if floor_strike is None:
+                return None
+            predicted = log_normal_prob_above(spot, floor_strike, sigma, T_years)
+            strike_desc = f">={floor_strike:.0f}"
+        elif strike_type == "less":
+            # yes if S_T <= cap_strike
+            if cap_strike is None:
+                return None
+            predicted = 1.0 - log_normal_prob_above(spot, cap_strike, sigma, T_years)
+            strike_desc = f"<={cap_strike:.0f}"
+        elif strike_type == "between":
+            # yes if floor_strike <= S_T <= cap_strike
+            if floor_strike is None or cap_strike is None:
+                return None
+            p_above_floor = log_normal_prob_above(spot, floor_strike, sigma, T_years)
+            p_above_cap = log_normal_prob_above(spot, cap_strike, sigma, T_years)
+            predicted = max(0.005, min(0.995, p_above_floor - p_above_cap))
+            strike_desc = f"in[{floor_strike:.0f},{cap_strike:.0f}]"
+        else:
+            # 'structured' or unknown — skip
+            return None
 
         # market implied — may be None if no liquidity
         implied = None
@@ -147,7 +180,7 @@ class CryptoVolBaseline(Baseline):
 
         rationale = (
             f"{pair} spot=${spot:.2f} σ={sigma*100:.1f}% T={T_years*365:.2f}d "
-            f"strike=${strike:.2f} {direction} "
+            f"{strike_desc} ({strike_type}) "
             f"predicted={predicted:.3f} implied={implied_str} edge={edge_str}"
         )
         return Prediction(
@@ -201,6 +234,9 @@ def main() -> int:
                 "ticker": m.ticker,
                 "close_ts": m.close_ts,
                 "title": m.title,
+                "strike_type": m.strike_type,
+                "floor_strike": m.floor_strike,
+                "cap_strike": m.cap_strike,
             }
             sdict = (
                 {

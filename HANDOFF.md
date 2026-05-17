@@ -1,7 +1,7 @@
 # handoff doc — kalshi trading bot
 
-**last updated:** 2026-05-16 (session 2 wrap, daemon running)
-**phase:** 1 complete-ish (pipeline working end-to-end, daemon running overnight to accumulate data)
+**last updated:** 2026-05-17 (session 2 final wrap, v1 model verified, daemon NOT running)
+**phase:** 1 complete — pipeline + v1 model + bug fix all verified. ready for overnight daemon run.
 **repo:** https://github.com/Vitaliy-Pikalo/kalshi-trading-bot (public)
 **local:** `C:\Users\pikal\Downloads\claude project`
 
@@ -29,9 +29,26 @@ categories chosen: **crypto** (BTC/ETH daily) primary, **tennis** (ATP/WTA) seco
 
 ---
 
+## ⚠️ critical bug found + fixed this session
+
+**v0 model lost $147 in paper (158 trades, 1.9% win rate)** because the ticker parser misread kalshi's range/below markets.
+
+| ticker pattern | what i thought | what it actually meant |
+|---|---|---|
+| `KXBTC-...-T87299.99` | yes if above $87,299 | depends on `strike_type` (could be "less") |
+| `KXBTC-...-B89750` | yes if below $89,750 | yes if BTC ∈ [$89,700, $89,799.99] (range bucket) |
+
+**fix:** v1 baseline now reads kalshi's `strike_type` + `floor_strike` + `cap_strike` fields directly from the API response — no more regex parsing. handles 3 cases: `greater`, `less`, `between`. verified on real markets — predictions are sane (0.5% for far-OTM, not 100%).
+
+new Market columns: `strike_type`, `floor_strike`, `cap_strike`. db was recreated with new schema.
+
+---
+
 ## what's running RIGHT NOW
 
-a **daemon** at `src/run/daemon.py` is (or should be) running in the background. it:
+**nothing.** daemon was stopped at end of session for the bug fix. user launches it themselves when ready.
+
+if it WERE running, it would be the daemon at `src/run/daemon.py`:
 
 - polls 768+ active markets every **60 sec** → snapshots table
 - runs paper sim every **5 min** with conservative gates → predictions + fills
@@ -55,24 +72,30 @@ a **daemon** at `src/run/daemon.py` is (or should be) running in the background.
 
 ## first 5 things to do in next session
 
+assumes you launched the daemon overnight via `_start_daemon.bat` or `_start_2_daemons.bat`
+
 1. **check the daemon is still alive + healthy**
    ```
    double-click _daemon_status.bat
    ```
-   - look at _daemon.log tail: should see POLL/TRADE/SETTLE entries
-   - look at db state: snapshots should be 10k+, predictions 2k+, fills 200+
-   - look at realized_pnl: this is the headline number
-2. **run analysis**
+   - look at log tail: should see POLL/TRADE/SETTLE entries (any errors?)
+   - look at db state: snapshots should be 10k+, predictions 2k+, fills 50+
+   - look at realized_pnl: this is the headline number for v1 model
+2. **kill the daemon before doing anything else** so you don't write while we analyze
+   ```
+   double-click _kill_python.bat
+   ```
+3. **run full analysis**
    ```
    .venv\Scripts\python.exe -m src.analyze
    ```
-   - win rate, total P&L, calibration plot
-3. **identify what worked**
+   - compare to v0 baseline: -94.9% ROI, 1.9% win rate
+   - v1 should be DRAMATICALLY better (or at least not catastrophic)
+4. **identify what worked**
    - which series_ticker had best return? (KXBTCD likely)
-   - which strike-distance-from-spot bucket worked best?
-   - what time of day did best (Tokyo 0-8 vs NY 13-21 UTC)?
-4. **tune gates based on data** — narrow further to what worked
-5. **decide phase 2 model** — xgboost on the features we now have, or stay with vol baseline + better tuning
+   - which strike_type buckets won (greater / less / between)?
+   - what time of day did best (Tokyo 0-8 UTC vs NY 13-21 UTC)?
+5. **decide phase 2 model** — xgboost on the features we now have, or stay with vol baseline + tune further
 
 ---
 

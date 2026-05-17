@@ -75,6 +75,15 @@ def find_target_series(client: KalshiClient) -> dict[str, list[dict]]:
     return {"crypto": crypto, "tennis": tennis}
 
 
+def _safe_float(v) -> float | None:
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+
 def parse_iso(ts: str | None) -> datetime | None:
     if not ts:
         return None
@@ -166,6 +175,9 @@ def store(
                         open_ts=parse_iso(m.get("open_time")),
                         close_ts=parse_iso(m.get("close_time")),
                         settled_outcome=None,
+                        strike_type=m.get("strike_type"),
+                        floor_strike=_safe_float(m.get("floor_strike")),
+                        cap_strike=_safe_float(m.get("cap_strike")),
                     )
                     stmt = stmt.on_conflict_do_update(
                         index_elements=["ticker"],
@@ -175,6 +187,9 @@ def store(
                             event_ticker=stmt.excluded.event_ticker,
                             open_ts=stmt.excluded.open_ts,
                             close_ts=stmt.excluded.close_ts,
+                            strike_type=stmt.excluded.strike_type,
+                            floor_strike=stmt.excluded.floor_strike,
+                            cap_strike=stmt.excluded.cap_strike,
                         ),
                     )
                     s.execute(stmt)

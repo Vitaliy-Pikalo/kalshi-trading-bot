@@ -130,6 +130,10 @@ def paper_trade_once(
                 "ticker": m.ticker,
                 "close_ts": m.close_ts,
                 "title": m.title,
+                "event_ticker": m.event_ticker,
+                "strike_type": m.strike_type,
+                "floor_strike": m.floor_strike,
+                "cap_strike": m.cap_strike,
             }
             sdict = {
                 "yes_bid": snap.yes_bid,

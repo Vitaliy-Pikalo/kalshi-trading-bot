@@ -44,6 +44,10 @@ class Market(Base):
     close_ts = Column(DateTime)
     settled_outcome = Column(String)  # 'yes' / 'no' / null if open
     first_seen = Column(DateTime, default=datetime.utcnow)
+    # strike semantics — populated from kalshi response, NOT ticker parsing
+    strike_type = Column(String)        # 'greater' | 'less' | 'between' | 'structured'
+    floor_strike = Column(Float)        # used by greater + between
+    cap_strike = Column(Float)          # used by less + between
 
 
 class Snapshot(Base):
