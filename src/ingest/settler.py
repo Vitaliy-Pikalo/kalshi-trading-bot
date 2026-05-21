@@ -24,7 +24,7 @@ import sys
 import time
 from datetime import datetime
 
-from src.utils import setup_utf8_stdout
+from src.utils import setup_utf8_stdout, utcnow_naive
 
 setup_utf8_stdout()
 
@@ -47,7 +47,7 @@ def compute_pnl_cents(side: str, result: str, price_cents: int, contracts: int) 
 
 def settle_once(client: KalshiClient) -> dict:
     """One settlement pass. Returns stats."""
-    now = datetime.utcnow()
+    now = utcnow_naive()
     stats = {
         "fills_checked": 0,
         "fills_settled": 0,
@@ -119,7 +119,7 @@ def main() -> int:
         while True:
             cycle += 1
             stats = settle_once(client)
-            ts = datetime.utcnow().strftime("%H:%M:%S")
+            ts = utcnow_naive().strftime("%H:%M:%S")
             print(
                 f"[{ts}] cycle #{cycle}: "
                 f"checked={stats['fills_checked']:4d} "

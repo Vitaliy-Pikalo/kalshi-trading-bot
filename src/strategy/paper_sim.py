@@ -69,12 +69,15 @@ def paper_trade_once(
     min_price_cents: int = 2,
     max_price_cents: int = 98,
     min_volume: int = 0,
+    allowed_strike_types: list[str] | None = None,
 ) -> dict:
     """One pass over recent (market, latest_snapshot) pairs. Returns stats.
 
     dedup_window_minutes: skip ticker if we've placed a paper fill within this window
     max_credible_edge: skip if |edge| > this (almost always model bug, not real edge)
     min_price_cents / max_price_cents: avoid 1¢ and 99¢ markets (huge round-trip cost)
+    allowed_strike_types: if set (e.g. ["between"]), only place fills for those strike types.
+        predictions are still written for ALL markets so calibration analysis stays intact.
     """
     if min_edge is None:
         min_edge = settings.min_edge_pct / 100.0
@@ -88,6 +91,7 @@ def paper_trade_once(
         "trades_skipped_dedup": 0,
         "trades_skipped_edge_too_big": 0,
         "trades_skipped_price_range": 0,
+        "trades_skipped_strike_type": 0,
         "edge_distribution": [],
     }
 
@@ -165,6 +169,13 @@ def paper_trade_once(
                 if require_liquidity and (snap.yes_ask is None or snap.yes_ask <= 0):
                     continue
                 if abs(pred.edge) < min_edge:
+                    continue
+
+                # strike_type allowlist (e.g. only "between" range markets in range_v1 preset)
+                # gate is here (not at market_rows level) so predictions are still written
+                # for diagnostic / calibration purposes on excluded markets.
+                if allowed_strike_types is not None and m.strike_type not in allowed_strike_types:
+                    stats["trades_skipped_strike_type"] += 1
                     continue
 
                 # dedup check
@@ -257,7 +268,8 @@ def main() -> int:
             f"paper_trades={stats['trades_paper']:3d} "
             f"skipped(dedup={stats['trades_skipped_dedup']}, "
             f"edge_too_big={stats['trades_skipped_edge_too_big']}, "
-            f"price={stats['trades_skipped_price_range']})  "
+            f"price={stats['trades_skipped_price_range']}, "
+            f"strike_type={stats['trades_skipped_strike_type']})  "
             f"{edge_summary}  ({elapsed:.1f}s)"
         )
 

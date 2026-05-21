@@ -24,7 +24,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 
-from src.utils import setup_utf8_stdout
+from src.utils import setup_utf8_stdout, utcnow_naive
 
 setup_utf8_stdout()
 
@@ -64,7 +64,7 @@ def get_active_tickers(
     else:
         series = CRYPTO_SERIES | TENNIS_SERIES
 
-    now = datetime.utcnow()
+    now = utcnow_naive()
     cutoff = now + timedelta(hours=max_close_hours)
     with session_scope() as s:
         rows = s.execute(
@@ -129,7 +129,7 @@ def poll_once(
         return 0
 
     rows_written = 0
-    now = datetime.utcnow()
+    now = utcnow_naive()
 
     for batch in chunked(tickers, batch_size):
         try:
@@ -190,7 +190,7 @@ def main() -> int:
             written = poll_once(client, tickers)
             t1 = time.time()
             elapsed = t1 - t0
-            ts_str = datetime.utcnow().strftime("%H:%M:%S")
+            ts_str = utcnow_naive().strftime("%H:%M:%S")
             print(
                 f"[{ts_str}] poll #{poll_count}: "
                 f"{len(tickers)} tracked, {written} snapshots written, "

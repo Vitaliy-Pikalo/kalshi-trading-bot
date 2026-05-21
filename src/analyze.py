@@ -86,22 +86,36 @@ def main() -> int:
                 )
 
         # calibration: pred bucket -> actual hit rate
+        # FIX (bug B): nearest prediction-at-or-before fill.ts, not cartesian join.
+        # the old naive `Fill.ticker == Prediction.ticker` inflated bucket counts
+        # by ~N predictions per ticker (e.g. n=31 reported when only 1 fill actually
+        # lived in that bucket).
         print(f"\nmodel calibration (predicted prob bucket -> actual win rate):")
-        # join fills with most recent prediction per ticker at fill time
-        # for simplicity: just take latest prediction per ticker
-        cal_rows = s.execute(
-            select(
-                Fill.ticker,
-                Fill.realized_pnl,
-                Fill.side,
-                Prediction.predicted_prob,
-            )
-            .join(Prediction, Prediction.ticker == Fill.ticker)
+        fill_rows = s.execute(
+            select(Fill.ticker, Fill.ts, Fill.side, Fill.realized_pnl)
             .where(Fill.realized_pnl.isnot(None))
         ).all()
 
         buckets: dict[tuple[float, float], list[int]] = defaultdict(list)
-        for ticker, pnl, side, pred_prob in cal_rows:
+        for ticker, fill_ts, side, pnl in fill_rows:
+            nearest = s.execute(
+                select(Prediction.predicted_prob)
+                .where(Prediction.ticker == ticker)
+                .where(Prediction.ts <= fill_ts)
+                .order_by(desc(Prediction.ts))
+                .limit(1)
+            ).first()
+            if nearest is None:
+                # fallback: first prediction after fill (shouldn't happen)
+                nearest = s.execute(
+                    select(Prediction.predicted_prob)
+                    .where(Prediction.ticker == ticker)
+                    .order_by(Prediction.ts)
+                    .limit(1)
+                ).first()
+            if nearest is None:
+                continue
+            pred_prob = nearest[0]
             # what prob did model assign to the SIDE we took?
             our_side_prob = pred_prob if side == "yes" else (1 - pred_prob)
             won = 1 if pnl > 0 else 0

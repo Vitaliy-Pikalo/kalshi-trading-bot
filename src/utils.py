@@ -3,8 +3,19 @@ from __future__ import annotations
 
 import io
 import sys
+from datetime import datetime, timezone
 
 _stdout_wrapped = False
+
+
+def utcnow_naive() -> datetime:
+    """Returns current UTC time as a naive datetime.
+
+    The codebase stores all timestamps as naive UTC (close_ts, snapshot.ts,
+    fill.ts, etc) for sqlite simplicity. This replaces the deprecated
+    `datetime.utcnow()` while preserving the same return value.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def setup_utf8_stdout() -> None:

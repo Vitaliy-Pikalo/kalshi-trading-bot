@@ -48,6 +48,19 @@ PRESETS = {
         "min_volume": 1000,             # market must have real trading activity
         "max_markets": 500,
     },
+    "range_v1": {
+        # session 4 strategy fork: edge lives in range (between) markets.
+        # v2 baseline showed between=+100% ROI / greater=+2% ROI (mostly layups).
+        # also attacks the [0.20, 0.40) overconfidence leak via max_credible_edge=0.15.
+        "min_edge": 0.05,               # was 0.03 — cut marginal trades
+        "max_credible_edge": 0.15,      # was 0.30 — blocks model's overconfident mid bucket
+        "min_price_cents": 10,          # was 5 — 0-10c price bucket was -1.4% ROI
+        "max_price_cents": 95,
+        "dedup_window_minutes": 240,
+        "min_volume": 1000,
+        "max_markets": 500,
+        "allowed_strike_types": ["between"],  # range markets only
+    },
     "balanced": {
         "min_edge": 0.02,
         "max_credible_edge": 0.40,
@@ -159,7 +172,8 @@ def main() -> int:
                         f"fills={stats['trades_paper']} "
                         f"skip(dedup={stats['trades_skipped_dedup']}, "
                         f"edge={stats['trades_skipped_edge_too_big']}, "
-                        f"price={stats['trades_skipped_price_range']})"
+                        f"price={stats['trades_skipped_price_range']}, "
+                        f"strike_type={stats.get('trades_skipped_strike_type', 0)})"
                     )
                     last_trade = now
                     did_work = True

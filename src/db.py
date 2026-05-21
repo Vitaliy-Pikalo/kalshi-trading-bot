@@ -24,10 +24,12 @@ from sqlalchemy import (
     Integer,
     String,
     create_engine,
+    event,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from src.config import settings
+from src.utils import utcnow_naive
 
 
 class Base(DeclarativeBase):
@@ -43,7 +45,7 @@ class Market(Base):
     open_ts = Column(DateTime)
     close_ts = Column(DateTime)
     settled_outcome = Column(String)  # 'yes' / 'no' / null if open
-    first_seen = Column(DateTime, default=datetime.utcnow)
+    first_seen = Column(DateTime, default=utcnow_naive)
     # strike semantics — populated from kalshi response, NOT ticker parsing
     strike_type = Column(String)        # 'greater' | 'less' | 'between' | 'structured'
     floor_strike = Column(Float)        # used by greater + between
@@ -54,7 +56,7 @@ class Snapshot(Base):
     __tablename__ = "snapshots"
     id = Column(Integer, primary_key=True, autoincrement=True)
     ticker = Column(String, ForeignKey("markets.ticker"), index=True, nullable=False)
-    ts = Column(DateTime, default=datetime.utcnow, index=True)
+    ts = Column(DateTime, default=utcnow_naive, index=True)
     yes_bid = Column(Integer)  # cents 0-100
     yes_ask = Column(Integer)
     no_bid = Column(Integer)
@@ -68,7 +70,7 @@ class Prediction(Base):
     __tablename__ = "predictions"
     id = Column(Integer, primary_key=True, autoincrement=True)
     ticker = Column(String, ForeignKey("markets.ticker"), index=True, nullable=False)
-    ts = Column(DateTime, default=datetime.utcnow, index=True)
+    ts = Column(DateTime, default=utcnow_naive, index=True)
     model_version = Column(String, nullable=False)
     predicted_prob = Column(Float, nullable=False)  # 0.0 - 1.0
     market_implied_prob = Column(Float, nullable=False)
@@ -79,7 +81,7 @@ class Fill(Base):
     __tablename__ = "fills"
     id = Column(Integer, primary_key=True, autoincrement=True)
     ticker = Column(String, ForeignKey("markets.ticker"), index=True, nullable=False)
-    ts = Column(DateTime, default=datetime.utcnow, index=True)
+    ts = Column(DateTime, default=utcnow_naive, index=True)
     side = Column(String, nullable=False)  # 'yes' or 'no'
     price_cents = Column(Integer, nullable=False)
     contracts = Column(Integer, nullable=False)
@@ -91,7 +93,7 @@ class Fill(Base):
 class BankrollSnapshot(Base):
     __tablename__ = "bankroll"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    ts = Column(DateTime, default=datetime.utcnow, index=True)
+    ts = Column(DateTime, default=utcnow_naive, index=True)
     total_usd = Column(Float, nullable=False)
     open_position_value = Column(Float, default=0.0)
     realized_pnl_today = Column(Float, default=0.0)
@@ -109,6 +111,23 @@ def _ensure_data_dir() -> None:
 
 _ensure_data_dir()
 engine = create_engine(settings.database_url, future=True)
+
+
+# bug C fix — enable sqlite WAL mode + sane busy timeout so concurrent readers
+# (e.g. analyzer running while daemon is writing) don't get "database is locked".
+# WAL also helps even with a single daemon doing rapid read+write cycles.
+@event.listens_for(engine, "connect")
+def _sqlite_pragmas(dbapi_conn, _connection_record) -> None:  # type: ignore[no-untyped-def]
+    if not settings.database_url.startswith("sqlite"):
+        return
+    cur = dbapi_conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA synchronous=NORMAL")   # safe under WAL, faster than FULL
+    cur.execute("PRAGMA busy_timeout=5000")    # wait up to 5s before raising lock error
+    cur.execute("PRAGMA foreign_keys=ON")
+    cur.close()
+
+
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
 
 
