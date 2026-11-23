@@ -147,6 +147,73 @@ class KalshiClient:
         r.raise_for_status()
         return r.json()
 
+    def post(
+        self,
+        endpoint: str,
+        body: dict[str, Any],
+        max_retries: int = 2,
+    ) -> dict[str, Any]:
+        """Authenticated POST. THIS SPENDS REAL MONEY when endpoint is an order route.
+
+        deliberately fewer retries than get(): a retried order can double-fill.
+        """
+        if self._client is None:
+            raise RuntimeError("use as context manager: `with KalshiClient() as k:`")
+        if not endpoint.startswith("/"):
+            endpoint = "/" + endpoint
+        url = self.base_url + endpoint
+        path_to_sign = self._path_for_signing(endpoint)
+        for attempt in range(max_retries):
+            _throttle()
+            headers = self._signed_headers("POST", path_to_sign)
+            r = self._client.post(url, headers=headers, json=body)
+            if r.status_code == 429 and attempt < max_retries - 1:
+                time.sleep(float(r.headers.get("Retry-After", 1.0)))
+                continue
+            r.raise_for_status()
+            return r.json()
+        r.raise_for_status()
+        return r.json()
+
+    def get_balance(self) -> dict[str, Any]:
+        """Account balance. Read-only."""
+        return self.get("/portfolio/balance")
+
+    def get_positions(self) -> dict[str, Any]:
+        """Open positions. Read-only."""
+        return self.get("/portfolio/positions")
+
+    def create_order(
+        self,
+        ticker: str,
+        side: str,               # "yes" | "no"
+        count: int,
+        limit_price_cents: int,
+        client_order_id: str,
+        action: str = "buy",
+    ) -> dict[str, Any]:
+        """Place a LIMIT order. Limit, never market -- a market order on a thin
+        tennis book can fill far from the price the strategy was measured at.
+
+        REAL MONEY when KALSHI_ENV=prod.
+        """
+        if side not in ("yes", "no"):
+            raise ValueError(f"side must be yes/no, got {side!r}")
+        if count < 1:
+            raise ValueError("count must be >= 1")
+        if not 1 <= limit_price_cents <= 99:
+            raise ValueError(f"limit price out of range: {limit_price_cents}")
+        body: dict[str, Any] = {
+            "ticker": ticker,
+            "client_order_id": client_order_id,
+            "side": side,
+            "action": action,
+            "count": count,
+            "type": "limit",
+        }
+        body["yes_price" if side == "yes" else "no_price"] = limit_price_cents
+        return self.post("/portfolio/orders", body)
+
     def list_markets(
         self,
         status: str | None = "open",

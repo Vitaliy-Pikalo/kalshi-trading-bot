@@ -19,6 +19,7 @@ run:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 import traceback
@@ -60,6 +61,91 @@ PRESETS = {
         "min_volume": 1000,
         "max_markets": 500,
         "allowed_strike_types": ["between"],  # range markets only
+    },
+    "range_v2": {
+        # phase 2.0.5 — calibrated model (isotonic regression applied to predicted_prob).
+        # key changes vs range_v1:
+        #   - use_calibration=True: applies iso_v1 models from data/calibration/
+        #   - max_credible_edge loosened: 0.15 → 0.40. the [0.20, 0.40) "leak" that
+        #     motivated the 0.15 cap doesn't exist on between markets (gap +2.2pp on n=182).
+        #     calibration now handles any residual bias properly, so the gate can open up.
+        #   - min_edge loosened slightly: 0.05 → 0.03. calibrated edge is more reliable
+        #     so we can accept smaller edges without worrying about model noise.
+        #   - model_version in db: crypto_vol_v1+iso_v1 (used by diagnose for A/B)
+        # v4 cutoff: fill_id = max(fill_id) + 1 at daemon restart (set in HANDOFF).
+        "min_edge": 0.03,
+        "max_credible_edge": 0.40,
+        "min_price_cents": 10,
+        "max_price_cents": 95,
+        "dedup_window_minutes": 240,
+        "min_volume": 1000,
+        "max_markets": 500,
+        "allowed_strike_types": ["between"],
+        "use_calibration": True,
+    },
+    "range_v3": {
+        # phase 2.1 — price-bucket focus. diagnose on 115 v4 settled fills shows
+        # ONLY the 70-80c entry bucket is profitable (+5% ROI, ~81% win rate).
+        # all other buckets (10-60c, 60-70c, >80c) are negative.
+        # this preset narrows the price window to the one profitable band.
+        # key changes vs range_v2:
+        #   - min_price_cents: 10 → 70 (cut unprofitable low-price trades)
+        #   - max_price_cents: 95 → 80 (cut unprofitable high-price trades)
+        #   - everything else identical to range_v2
+        # v5 cutoff: fill_id = 262 (max fill_id at restart = 261).
+        "min_edge": 0.03,
+        "max_credible_edge": 0.40,
+        "min_price_cents": 70,
+        "max_price_cents": 80,
+        "dedup_window_minutes": 240,
+        "min_volume": 1000,
+        "max_markets": 500,
+        "allowed_strike_types": ["between"],
+        "use_calibration": True,
+    },
+    "range_v4": {
+        # phase 2.2 -- REVERTS two changes that were justified by a broken dataset,
+        # and adds a fee gate derived from arithmetic rather than fitted to a table.
+        #
+        # what the complete calibration audit showed (658 markets / 15,281 rows,
+        # after derive_outcomes_from_fills.py fixed the stale settled_outcome column):
+        #
+        #   scheme 4 -- the prediction nearest each actual fill, n=355:
+        #     [0.20,0.40)  n=196 (55% of fills)  predicted 26.5%  actual 27.0%  (+0.6pp)
+        #     [0.95,1.01)  n=115 (32% of fills)  predicted 97.6%  actual 79.1%  (-18.5pp)
+        #
+        # the model is WELL calibrated in its main working range and badly
+        # OVERconfident at the top. the session-7 table that motivated range_v2 said
+        # the opposite ([0.60,0.80) -> 98.3% actual, "alpha left on the table"); with
+        # the complete dataset that bucket reads 71.6% -> 71.9%. the underconfidence
+        # never existed -- it was an artifact of a partially-backfilled outcomes column.
+        #
+        # consequences, and what this preset does about them:
+        #   - use_calibration False: iso_v1_between.pkl maps 50% -> 97%, i.e. it pushes
+        #     probabilities UP, in exactly the bucket that is already 18.5pp too high.
+        #     it was fitted on the superseded table. refit before re-enabling.
+        #   - max_credible_edge 0.40 -> 0.15: at a 75c market price the bot computes
+        #     edge = 0.976 - 0.75 = +0.226 and believes it. true edge is
+        #     0.791 - 0.75 = +0.041. it thinks its edge is 5.5x larger than it is,
+        #     and 0.40 was raised from 0.15 precisely to let those through.
+        #   - price window back to 10-95c: range_v3's 70-80c band was selected on
+        #     n=115 fills GROSS of fees. net of fees that band earns +0.01%. it is
+        #     not a profitable bucket, it is the fee. replacing a fitted window with
+        #     a derived fee gate is the point of this preset.
+        #   - fee_aware True: require edge > fee/stake + 2pp. see paper_sim.py.
+        #
+        # v6 cutoff: set to max(fill_id)+1 at restart and record it in HANDOFF.md.
+        "min_edge": 0.05,
+        "max_credible_edge": 0.15,
+        "min_price_cents": 10,
+        "max_price_cents": 95,
+        "dedup_window_minutes": 240,
+        "min_volume": 1000,
+        "max_markets": 500,
+        "allowed_strike_types": ["between"],
+        "use_calibration": False,
+        "fee_aware": True,
+        "fee_edge_margin": 0.02,
     },
     "balanced": {
         "min_edge": 0.02,
@@ -164,16 +250,22 @@ def main() -> int:
                         raise
 
             # TRADE
-            if now - last_trade >= TRADE_INTERVAL:
+            # data/NO_PAPER_TRADE present -> skip paper trading, keep polling/settling
+            if now - last_trade >= TRADE_INTERVAL and not os.path.exists("data/NO_PAPER_TRADE"):
                 try:
                     stats = paper_trade_once(**preset)
                     log(
                         f"TRADE: seen={stats['markets_seen']} preds={stats['predictions_written']} "
                         f"fills={stats['trades_paper']} "
-                        f"skip(dedup={stats['trades_skipped_dedup']}, "
-                        f"edge={stats['trades_skipped_edge_too_big']}, "
+                        f"skip(min_edge={stats.get('trades_skipped_min_edge', 0)}, "
+                        f"strike_type={stats.get('trades_skipped_strike_type', 0)}, "
+                        f"dedup={stats['trades_skipped_dedup']}, "
+                        f"edge_too_big={stats['trades_skipped_edge_too_big']}, "
                         f"price={stats['trades_skipped_price_range']}, "
-                        f"strike_type={stats.get('trades_skipped_strike_type', 0)})"
+                        f"fee={stats.get('trades_skipped_fee', 0)}, "
+                        f"nan={stats.get('trades_skipped_nan_edge', 0)}, "
+                        f"stake={stats.get('trades_skipped_zero_stake', 0)}, "
+                        f"illiq={stats.get('trades_skipped_no_liquidity', 0)})"
                     )
                     last_trade = now
                     did_work = True

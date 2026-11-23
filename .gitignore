@@ -56,3 +56,35 @@ logs/
 _*.bat
 _*.txt
 _*_output.*
+
+# --- added 17 aug: tennis forward test ---
+# live-trading arm/kill switches must NEVER be in version control
+data/LIVE_TRADING_ARMED
+data/HALT
+# sqlite side files change every second while the daemon runs
+data/*.db
+data/*.db-wal
+data/*.db-shm
+# large derived datasets -- regenerate with backfill_tennis_api.py / replay_gates.py
+data/replay_dataset.csv
+data/tennis_prices_15m.csv
+data/calibration_dataset_v1.csv
+data/spot_cache/
+data/calibration/
+data/_bet_log_runs.txt
+# junk from mistyped shell commands
+_daemon_test.out
+$
+188
+cd
+
+# --- added 23 nov: portfolio cleanup guards ---
+data/LIVE_TRADING_ARMED*
+data/NO_PAPER_TRADE
+*.bak-*
+.fuse_hidden*
+scholarship_profile.md
+options-quant-bot/
+archive/
+_*.ps1
+_*.py

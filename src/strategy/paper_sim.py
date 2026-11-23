@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import argparse
 import math
+import pickle
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from src.utils import setup_utf8_stdout
 
@@ -25,6 +27,7 @@ from sqlalchemy import desc, select  # noqa: E402
 
 from src.config import settings  # noqa: E402
 from src.db import Fill, Market, Prediction as PredRow, Snapshot, session_scope  # noqa: E402
+from src.fees import kalshi_fee_usd  # noqa: E402
 from src.strategy.base import Baseline  # noqa: E402
 from src.strategy.crypto_vol import CryptoVolBaseline  # noqa: E402
 from src.strategy.tennis_elo import TennisEloBaseline  # noqa: E402
@@ -33,6 +36,50 @@ from src.strategy.tennis_elo import TennisEloBaseline  # noqa: E402
 # that returns a non-None prediction. each baseline returns None for markets
 # it doesn't handle, so registering all is safe.
 BASELINES: list[Baseline] = [CryptoVolBaseline(), TennisEloBaseline()]
+
+# calibration models — loaded lazily on first use
+_CALIBRATION_MODELS: dict[str, object] | None = None
+_CALIBRATION_DIR = Path("data/calibration")
+
+
+def _load_calibration_models() -> dict[str, object]:
+    """load isotonic models per strike_type from data/calibration/iso_v1_*.pkl.
+
+    called once on first paper_trade_once() with use_calibration=True.
+    returns dict: {"between": IsotonicRegression, "greater": IsotonicRegression, ...}
+    raises FileNotFoundError if a model file is missing.
+    """
+    models: dict[str, object] = {}
+    for strike_type in ("between", "greater"):
+        path = _CALIBRATION_DIR / f"iso_v1_{strike_type}.pkl"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"calibration model not found: {path}. "
+                f"run _phase2_fit_isotonic.bat first."
+            )
+        with path.open("rb") as f:
+            models[strike_type] = pickle.load(f)
+    return models
+
+
+def _apply_calibration(
+    raw_prob: float,
+    strike_type: str | None,
+    models: dict[str, object],
+) -> float:
+    """apply isotonic calibration to a raw predicted prob.
+
+    if no model exists for this strike_type, returns raw_prob unchanged.
+    """
+    model = models.get(strike_type or "")
+    if model is None:
+        return raw_prob
+    try:
+        import numpy as np
+        calibrated = float(model.predict(np.array([raw_prob]))[0])
+        return max(0.0, min(1.0, calibrated))
+    except Exception:
+        return raw_prob  # fall back to raw on any error
 
 
 def kelly_size(
@@ -70,6 +117,9 @@ def paper_trade_once(
     max_price_cents: int = 98,
     min_volume: int = 0,
     allowed_strike_types: list[str] | None = None,
+    use_calibration: bool = False,
+    fee_aware: bool = False,
+    fee_edge_margin: float = 0.0,
 ) -> dict:
     """One pass over recent (market, latest_snapshot) pairs. Returns stats.
 
@@ -78,7 +128,17 @@ def paper_trade_once(
     min_price_cents / max_price_cents: avoid 1¢ and 99¢ markets (huge round-trip cost)
     allowed_strike_types: if set (e.g. ["between"]), only place fills for those strike types.
         predictions are still written for ALL markets so calibration analysis stays intact.
+    use_calibration: if True, apply isotonic calibration (loaded from data/calibration/)
+        to predicted_prob before edge calc. model_version gets '+iso_v1' suffix so
+        diagnose can A/B compare calibrated vs uncalibrated fills.
+    fee_aware: if True, require the edge to exceed the Kalshi fee expressed as a
+        fraction of the stake, plus fee_edge_margin. See the gate below for why.
+    fee_edge_margin: extra edge required on top of the fee, e.g. 0.02 for 2pp.
     """
+    global _CALIBRATION_MODELS
+    if use_calibration and _CALIBRATION_MODELS is None:
+        _CALIBRATION_MODELS = _load_calibration_models()
+
     if min_edge is None:
         min_edge = settings.min_edge_pct / 100.0
 
@@ -92,6 +152,17 @@ def paper_trade_once(
         "trades_skipped_edge_too_big": 0,
         "trades_skipped_price_range": 0,
         "trades_skipped_strike_type": 0,
+        "trades_skipped_fee": 0,
+        # These three paths used to `continue` silently, so a TRADE line reading
+        # "seen=12 preds=12 fills=0 skip(dedup=1, edge=0, price=2, strike_type=1)"
+        # left 8 markets unaccounted for and gave no way to tell whether a preset
+        # produced zero fills because of min_edge, liquidity, or a NaN prediction.
+        # Counting them is the difference between diagnosing a preset in one log
+        # line and guessing at it for days.
+        "trades_skipped_min_edge": 0,
+        "trades_skipped_nan_edge": 0,
+        "trades_skipped_no_liquidity": 0,
+        "trades_skipped_zero_stake": 0,
         "edge_distribution": [],
     }
 
@@ -150,25 +221,46 @@ def paper_trade_once(
                 pred = bl.predict(mdict, sdict)
                 if pred is None:
                     continue
+
+                # apply isotonic calibration if enabled
+                # calibration maps raw predicted_prob → calibrated_prob per strike_type,
+                # then recalculates edge from the calibrated prob.
+                # model_version gets '+iso_v1' suffix so diagnose can A/B compare.
+                if use_calibration and _CALIBRATION_MODELS is not None:
+                    cal_prob = _apply_calibration(
+                        pred.predicted_prob, m.strike_type, _CALIBRATION_MODELS
+                    )
+                    cal_edge = cal_prob - pred.market_implied_prob
+                    effective_prob = cal_prob
+                    effective_edge = cal_edge
+                    model_version = f"{bl.name}+iso_v1"
+                else:
+                    effective_prob = pred.predicted_prob
+                    effective_edge = pred.edge
+                    model_version = bl.name
+
                 # write the prediction row (always — useful for calibration later)
                 s.add(
                     PredRow(
                         ticker=m.ticker,
                         ts=now,
-                        model_version=bl.name,
-                        predicted_prob=pred.predicted_prob,
+                        model_version=model_version,
+                        predicted_prob=effective_prob,
                         market_implied_prob=pred.market_implied_prob,
-                        edge=pred.edge if not math.isnan(pred.edge) else 0.0,
+                        edge=effective_edge if not math.isnan(effective_edge) else 0.0,
                     )
                 )
                 stats["predictions_written"] += 1
 
                 # paper trade only if edge is real
-                if math.isnan(pred.edge):
+                if math.isnan(effective_edge):
+                    stats["trades_skipped_nan_edge"] += 1
                     continue
                 if require_liquidity and (snap.yes_ask is None or snap.yes_ask <= 0):
+                    stats["trades_skipped_no_liquidity"] += 1
                     continue
-                if abs(pred.edge) < min_edge:
+                if abs(effective_edge) < min_edge:
+                    stats["trades_skipped_min_edge"] += 1
                     continue
 
                 # strike_type allowlist (e.g. only "between" range markets in range_v1 preset)
@@ -184,21 +276,22 @@ def paper_trade_once(
                     continue
 
                 # max-credible-edge gate: massive edges are usually model bugs
-                if abs(pred.edge) > max_credible_edge:
+                if abs(effective_edge) > max_credible_edge:
                     stats["trades_skipped_edge_too_big"] += 1
                     continue
 
-                stats["edge_distribution"].append(pred.edge)
+                stats["edge_distribution"].append(effective_edge)
 
                 # which side? if predicted > implied, buy YES at yes_ask
                 # if predicted < implied, buy NO at no_ask
-                if pred.edge > 0:
+                if effective_edge > 0:
                     side = "yes"
                     price_cents = snap.yes_ask or 0
                 else:
                     side = "no"
                     price_cents = snap.no_ask or 0
                 if price_cents <= 0 or price_cents >= 100:
+                    stats["trades_skipped_price_range"] += 1
                     continue
                 # min/max price gate: avoid 1¢ and 99¢ markets (huge spread cost)
                 if price_cents < min_price_cents or price_cents > max_price_cents:
@@ -216,8 +309,38 @@ def paper_trade_once(
                     max_pct=settings.max_risk_per_trade_pct / 100.0,
                 )
                 if stake <= 0:
+                    # Kelly returned nothing. With a $100 bankroll and a 1% cap
+                    # the risk budget is $1.00, so this fires whenever the edge
+                    # is too thin for fractional Kelly to justify a single
+                    # contract. Worth counting separately from a gate rejection:
+                    # it means the SIZER declined, not the strategy.
+                    stats["trades_skipped_zero_stake"] += 1
                     continue
                 contracts = max(1, int(stake / (price_cents / 100.0)))
+
+                # Fee-aware edge gate.
+                #
+                # Kalshi charges roundup(0.07 * C * P * (1-P)) on the opening
+                # order. As a fraction of the stake that is fee / (C * P), which
+                # at one contract is ~2.7% at 75c and ~10.5% at 19c -- the
+                # round-up dominates on single-contract orders, and it is worst
+                # at the cheap end where the stake is small.
+                #
+                # An edge smaller than that fraction is a guaranteed loss no
+                # matter how well calibrated the model is. Measured on 355 v4
+                # fills: the 70-90c bucket earned +2.70% gross and +0.01% NET.
+                # The book had converged on a trade that is arithmetically the
+                # fee, because nothing in this decision path had ever seen one.
+                #
+                # This gate is derived from the fee formula, not fitted to a
+                # bucket table -- which is deliberately unlike the 70-80c price
+                # window in range_v3, chosen off n=115 gross-of-fees fills.
+                if fee_aware:
+                    stake_usd = contracts * price_cents / 100.0
+                    fee_frac = kalshi_fee_usd(price_cents, contracts) / stake_usd
+                    if abs(effective_edge) < fee_frac + fee_edge_margin:
+                        stats["trades_skipped_fee"] += 1
+                        continue
 
                 s.add(
                     Fill(
@@ -243,6 +366,8 @@ def main() -> int:
     parser.add_argument("--duration", type=int, default=0)
     parser.add_argument("--min-edge", type=float, default=None, help="edge threshold (0-1)")
     parser.add_argument("--max-markets", type=int, default=500)
+    parser.add_argument("--use-calibration", action="store_true",
+                        help="apply isotonic calibration from data/calibration/iso_v1_*.pkl")
     args = parser.parse_args()
 
     started = time.time()
@@ -253,6 +378,7 @@ def main() -> int:
         stats = paper_trade_once(
             min_edge=args.min_edge,
             max_markets=args.max_markets,
+            use_calibration=args.use_calibration,
         )
         elapsed = time.time() - t0
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")

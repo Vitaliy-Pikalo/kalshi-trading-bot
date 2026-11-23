@@ -1,5 +1,8 @@
 # kalshi trading bot — the story
 
+> **update, nov 2026:** final results are in `README.md`. after fees and on holdout data, neither the crypto nor the tennis strategy has an edge. this story covers the first weeks (v1–v3).
+
+
 a plain-language writeup of what this project is, what i built, what i learned, and where it's going. written for anyone — no quant background required.
 
 ---
